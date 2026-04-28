@@ -1,0 +1,39 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# ML artifacts (regenerated; don't commit large binaries)
+mlruns/
+*.joblib
+pdm-ai-engine/*.json
+pdm-ai-engine/Data/
+
+# Simulator artifacts
+machine-simulator/backend/simulation_v2.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Working docs — internal to the sprint, not for GitHub
+CLAUDE.md
+SPRINT.md
+audit_notes.md
+instruction.md
+
+# Frontend
+node_modules/
+dist/
+build/
