@@ -311,15 +311,6 @@ async def get_ff_debug():
         }
     }
 
-@router.post("/predict")
-async def predict_failure(data: dict):
-    """
-    Mock AI prediction endpoint to prevent 404s.
-    Returns a dummy risk score.
-    """
-    return {"risk_score": 0.05, "status": "HEALTHY"}
-
-
 @router.get("/fast-forward/record-count")
 async def get_record_count():
     """
@@ -384,33 +375,6 @@ async def get_db_stats():
         "ok_count": ok_count,
         "ng_count": ng_count,
         "down_count": down_count
-    }
-
-
-@router.post("/fast-forward/ai")
-async def fast_forward_ai(days: int = 7):
-    """
-    Simulates N DAYS of production using Statistical AI.
-    Learns from existing data in DB to model patterns.
-    """
-    from backend.ai.prediction import ProductionAI
-    from backend.simulation.fast_forward import get_last_timestamp
-    from datetime import datetime
-    
-    # 1. Determine Start Time
-    last_ts = await get_last_timestamp()
-    start_time = last_ts if last_ts else datetime.now()
-    
-    # 2. Run AI Prediction
-    ai = ProductionAI()
-    
-    async with AsyncSessionLocal() as session:
-        # Pass session for training AND inserting
-        result = await ai.predict_week(session, start_time, days=days)
-        
-    return {
-        "message": f"AI Prediction Complete: {days} Days Generated",
-        "stats": result
     }
 
 
