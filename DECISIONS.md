@@ -257,3 +257,8 @@ The target for the classifier is `will_fail_10min` (boolean — fails within 600
 - Poetry / uv / pdm shared workspace: overkill for two services with simple dep needs.
 
 **Implication:** `docker compose up` is the canonical "boot the whole system" command — not a merged venv. Local dev activates one venv at a time per service. Each service's `requirements.txt` / `pyproject.toml` is the single source of truth for its deps.
+
+**Implementation notes (Day 2 — 2026-04-28):**
+- Both venvs are now Python 3.11.9 via `pyenv exec python -m venv .venv` (rebuilt from pyenv on Day 2; the Day 1 simulator venv had silently used Homebrew's 3.11.13 — fixed). See [LOGBOOK.md](LOGBOOK.md) Day 2 venv-state entry for the incident that surfaced this.
+- `pdm-ai-engine/pyproject.toml` declares `requires-python = ">=3.11,<3.12"`, narrow enough that a future Python 3.12+ cannot accidentally satisfy the install constraint and re-introduce drift.
+- Activation is automated via `direnv` — each service has a `.envrc` that runs `source .venv/bin/activate`. Cd into a service directory, the right venv loads; cd out, it unloads. No manual `source` step. The `.envrc` files are gitignored (per-developer tooling, not project code).

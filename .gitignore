@@ -10,16 +10,24 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# direnv (per-developer, never committed)
+.envrc
+
 # OS / editor
 .DS_Store
 .vscode/
 .idea/
 
-# ML artifacts (regenerated; don't commit large binaries)
+# ML artifacts (regenerated; don't commit by default)
 mlruns/
 *.joblib
 pdm-ai-engine/*.json
 pdm-ai-engine/Data/
+
+# Exception: v1 baseline models live in pdm-ai-engine/models/ for clone-and-run.
+# Day 7 onward, new models go to MLflow's artifact store (not git).
+!pdm-ai-engine/models/*.joblib
+!pdm-ai-engine/models/*.json
 
 # Simulator artifacts
 machine-simulator/backend/simulation_v2.db
