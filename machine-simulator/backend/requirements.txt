@@ -7,3 +7,5 @@ pydantic-settings
 python-dotenv
 pandas
 openpyxl
+alembic
+psycopg2-binary

@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 # --- Shared Base Models ---
 
+
 class TelemetryBase(BaseModel):
     # Identity
     timestamp_sim: str
@@ -17,7 +18,6 @@ class TelemetryBase(BaseModel):
     quench_water_flow: float
     quench_pressure: float
     induction_power: float
-    tempering_speed: float
     coil_scan_speed: float
 
     # Health
@@ -30,19 +30,23 @@ class TelemetryBase(BaseModel):
     ng_count: int = 0
     is_anomaly: bool = False
 
+
 class SimRunBase(BaseModel):
     status: str
     total_rows: int = 0
 
 # --- Create Models (Input) ---
 
+
 class TelemetryCreate(TelemetryBase):
     pass
+
 
 class SimRunCreate(SimRunBase):
     pass
 
 # --- Read Models (Output) ---
+
 
 class TelemetryRead(TelemetryBase):
     id: int
@@ -50,6 +54,7 @@ class TelemetryRead(TelemetryBase):
 
     class Config:
         from_attributes = True
+
 
 class SimRunRead(SimRunBase):
     id: int
