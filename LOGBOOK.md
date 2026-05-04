@@ -209,3 +209,32 @@ A second, separate gotcha showed up while fixing this: chaining `source .venv/bi
 - **Tester mode is a different prompt, not a different person.** The same LLM produced the smoke test ("looks fine, ship it") and the tester-mode pass ("here are four bugs"). The difference was *being asked the right question*. **Bake the question into the workflow:** after every "module done" milestone, before commit, an explicit "what would break this?" pass. Five minutes of cost, multiple incidents prevented per sprint at this density.
 
 ---
+
+## Day 4 Module 2 — failure-mode signatures, designed for distinguishability not realism — 2026-05-04
+
+**What happened:** Implemented the three CLAUDE.md failure modes (coolant_pump, quench_system, power_supply) on top of the Module 1 baseline physics. The decision that mattered most was not "make each signature physically accurate" — it was **make each signature orthogonal in feature space**. CLAUDE.md prescribes the affected sensors per mode, but not the magnitudes. The magnitudes I picked were tuned so each mode owns a unique "marker sensor" that no other mode touches:
+
+  - coolant_pump owns `quench_water_temp` (rises in every state)
+  - quench_system owns `quench_pressure` (drops sharply in QUENCH; nothing else touches it)
+  - power_supply owns `induction_power` (drops + becomes noisy in HEATING; nothing else touches it)
+
+Plus secondary signals (flow drop, part_temp deviation) overlap across modes with *different magnitudes* per mode for redundancy. End-of-quench part_temp at severity=1 is ~130°C for coolant_pump vs ~250°C for quench_system — same secondary signal, different magnitude → still separable.
+
+Each signature is implemented as a state-aware mutator: `apply_failure_signature(reading, mode, severity, state)` only modifies sensors active during the relevant cycle phase. Applying a flow drop during HEATING (when flow is 0) would emit a "ghost failure" the model can't ground in physics. State-awareness is non-negotiable for ML correctness.
+
+Severity ramps linearly from 0 (onset start) to 1 (failure point) over a configurable `onset_seconds`. At severity=1, the engine transitions the cycle to DOWN. The label columns track the trajectory: `failure_mode` is set the moment a failure is injected, `time_to_failure_s` decreases each tick. Crucially, `will_fail_10min` stays NULL — that's a Module 3 look-ahead label, computing it at write-time would leak future info.
+
+**Why the magnitudes had to be designed, not just chosen:** A naive implementation of CLAUDE.md's spec — "coolant pump degradation: flow drops, water_temp rises, part_temp elevated" — left every mode using overlapping sensor sets with no clear separation. Pure signal-overlap means the classifier sees ambiguous patterns: was that a quench_system failure or a coolant_pump failure? The fix was to give each mode a **marker sensor** that only that mode touches, then layer secondary signals on top for redundancy. Decision derived from D4 (binary classifier, not multi-class): the binary target is "will fail in 10 min", but downstream RUL / explainability work depends on each mode being identifiable in the feature vector. Orthogonal markers are the cheapest way to guarantee that.
+
+**The same QA discipline as Module 1 caught nothing material this time** — the rewrite habit from Module 1 (state-aware checks per cycle phase, baseline noise floor sized to be clearly subordinate to signature magnitudes, lifecycle lock, validator-on-input) carried over. The expert review pass found:
+  - Rejection paths all return appropriate codes (409 for engine-state conflicts, 422 for input validation)
+  - `/clear-failure` mid-onset returns sensors to baseline immediately and lets the cycle continue
+  - `/inject-failure` while a failure is active is rejected (no mode-swap chaos)
+  - Magnitudes verified end-to-end with `onset_seconds=30` runs per mode: each signature deviates per spec, unaffected sensors stay inside baseline noise envelope
+
+**Takeaway:**
+- **CLAUDE.md spec is a recipe, not the dish.** It lists which sensors are affected per mode but doesn't specify magnitudes, noise increases, or onset rates. Translating spec to ML-ready signatures requires *design choices* that depend on what the downstream model needs (orthogonality, distinguishability, signal-to-noise floor). When porting future spec docs into code, **read for what's *not* specified** — that's where judgement calls hide, and where ML correctness lives.
+- **State-awareness is the cheap defense against ghost signals.** Mutating sensors that aren't active during the current cycle phase (flow during HEATING, power during QUENCH) emits unlabelled noise that confuses the model. Every signature function takes `state` as an argument and early-returns when it's not the relevant phase. Five lines of guard code per mode prevented an entire class of training-data corruption.
+- **Designing for the model is a different discipline than designing for physics.** A real coolant pump might degrade with non-linear hysteresis and thermal feedback loops. We use linear severity ramps because rolling-mean and rate-of-change features pick the slope up cleanly, and because the *temporal coherence* of the degradation (not its physical accuracy) is what the model learns. The simulator's job is to be a clean teacher, not a faithful emulator.
+
+---

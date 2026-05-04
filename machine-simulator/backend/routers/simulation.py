@@ -1,6 +1,7 @@
 import logging
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +35,41 @@ async def reset_simulation(db: AsyncSession = Depends(get_db)):
     engine = get_engine()
     await engine.reset(db)
     return {"message": "reset complete", "status": engine.status()}
+
+
+@router.post("/inject-failure")
+async def inject_failure(
+    mode: Literal["coolant_pump", "quench_system", "power_supply"] = Query(
+        ..., description="One of the three CLAUDE.md failure modes"
+    ),
+    onset_seconds: float = Query(
+        ..., gt=0.0, le=3600.0,
+        description="Seconds from now until severity reaches 1.0 and the "
+                    "machine transitions to DOWN. Range: 0 < t <= 3600.",
+    ),
+):
+    """Schedule a failure-mode degradation that ramps linearly from
+    severity=0 (now) to severity=1 (onset_seconds from now). Sensors
+    affected per the mode's CLAUDE.md spec; unaffected sensors stay
+    at baseline."""
+    engine = get_engine()
+    try:
+        engine.inject_failure(mode=mode, onset_seconds=onset_seconds)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"message": "failure injected", "status": engine.status()}
+
+
+@router.post("/clear-failure")
+async def clear_failure():
+    """Cancel any active failure-mode degradation. Sensors return to
+    baseline immediately; cycle state is unchanged (no auto-recovery
+    from DOWN — call /reset for that)."""
+    engine = get_engine()
+    engine.clear_failure()
+    return {"message": "failure cleared", "status": engine.status()}
 
 
 @router.get("/status")
