@@ -1,38 +1,40 @@
-from fastapi import FastAPI
+import logging
 from contextlib import asynccontextmanager
-from backend.database import engine, Base
-from backend.routers import simulation, export
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from backend.config import settings
+from backend.logging_config import configure_logging
+from backend.routers import export, simulation
+from backend.simulation.engine import get_engine
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    # Initialize Default SimRun for Live View
-    from sqlalchemy import select
-    from backend.models import SimRun
-    from backend.database import AsyncSessionLocal
-    
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            result = await session.execute(select(SimRun).where(SimRun.id == 1))
-            run = result.scalar()
-            if not run:
-                print("🆕 INITIALIZING DEFAULT SIMULATION RUN (ID=1)")
-                new_run = SimRun(id=1, status="RUNNING", total_rows=0)
-                session.add(new_run)
-                await session.commit()
+    logger.info(
+        "simulator starting up | tick_rate_hz=%s failure_probability=%s db=%s",
+        settings.simulator_tick_rate_hz,
+        settings.failure_probability,
+        settings.database_url.split("@")[-1],
+    )
     yield
+    engine = get_engine()
+    if engine.running:
+        await engine.stop()
+    logger.info("simulator shutting down")
+
 
 app = FastAPI(title="Induction Hardening Machine Simulator", lifespan=lifespan)
 
-# CORS Configuration
 origins = [
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
 ]
 
 app.add_middleware(
@@ -43,14 +45,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include Routers
 app.include_router(simulation.router)
 app.include_router(export.router)
 
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "backend"}
+    return {"status": "ok", "service": "machine-simulator"}
+
 
 @app.get("/")
 async def root():
-    return {"message": "Induction Hardening Simulator API is running. Go to /health for status."}
+    return {"message": "Induction Hardening Simulator API. See /docs."}

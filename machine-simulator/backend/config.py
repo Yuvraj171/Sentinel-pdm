@@ -20,8 +20,8 @@ class Settings(BaseSettings):
 
     simulator_host: str = "0.0.0.0"
     simulator_port: int = 8000
-    simulator_tick_rate_hz: float = 1.0
-    failure_probability: float = 0.05
+    simulator_tick_rate_hz: float = Field(default=1.0, gt=0.0)
+    failure_probability: float = Field(default=0.05, ge=0.0, le=1.0)
 
     @field_validator("database_url")
     @classmethod

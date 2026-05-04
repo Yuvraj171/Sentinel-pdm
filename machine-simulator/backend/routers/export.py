@@ -131,8 +131,7 @@ async def export_excel_run(
                 "Flow (LPM)": t.quench_water_flow,
                 "Pressure (Bar)": t.quench_pressure,
                 "Scan Speed (mm/s)": t.coil_scan_speed,
-                "Temper Speed (mm/s)": t.tempering_speed,
-                
+
                 # Health & Maint
                 "Coil Life": t.coil_life_counter,
                 "Downtime Reason": t.downtime_reason,
