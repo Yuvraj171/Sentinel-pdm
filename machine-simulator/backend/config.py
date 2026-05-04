@@ -38,4 +38,7 @@ class Settings(BaseSettings):
         return v
 
 
-settings = Settings()
+settings = Settings()  # pyright: ignore[reportCallIssue]
+# Pyright can't see that pydantic-settings populates `database_url` from
+# the .env file at runtime, so it flags the call as missing the required
+# argument. Suppress for this single instantiation.

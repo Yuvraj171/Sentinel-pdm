@@ -35,20 +35,25 @@ class TelemetryWriter:
 
 async def get_or_create_live_sim_run() -> int:
     """The live dashboard always writes to a single SimRun (id=1).
-    Fast-gen runs (Module 3) will create their own SimRun per invocation.
+    Fast-gen runs create their own SimRun per invocation (id >= 2).
     """
+    # Imported here to avoid circular import (engine -> persistence -> engine).
+    from backend.simulation.engine import LIVE_SIM_RUN_ID
+
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            result = await session.execute(select(SimRun).where(SimRun.id == 1))
+            result = await session.execute(
+                select(SimRun).where(SimRun.id == LIVE_SIM_RUN_ID)
+            )
             run = result.scalar_one_or_none()
             if run is None:
                 run = SimRun(
-                    id=1,
+                    id=LIVE_SIM_RUN_ID,
                     status="RUNNING",
                     total_rows=0,
                     start_time=datetime.utcnow(),
                     session_start_time=datetime.utcnow(),
                 )
                 session.add(run)
-                logger.info("created live SimRun id=1")
+                logger.info("created live SimRun id=%d", LIVE_SIM_RUN_ID)
             return run.id

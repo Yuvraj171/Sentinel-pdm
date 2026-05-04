@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 VALID_FAILURE_MODES = ("coolant_pump", "quench_system", "power_supply")
 
+# Live mode always writes to a single SimRun (id=1). Fast-gen runs
+# create their own SimRuns starting from id=2.
+LIVE_SIM_RUN_ID = 1
+
 
 class SimulationEngine:
     def __init__(self) -> None:
@@ -104,8 +108,14 @@ class SimulationEngine:
     async def reset(self, session: AsyncSession) -> None:
         async with self._lock():
             await self._stop_inner()
-            await session.execute(delete(Telemetry))
-            result = await session.execute(select(SimRun).where(SimRun.id == 1))
+            # Scope deletion to the live SimRun — fast-gen training data
+            # under other SimRun ids is preserved.
+            await session.execute(
+                delete(Telemetry).where(Telemetry.sim_run_id == LIVE_SIM_RUN_ID)
+            )
+            result = await session.execute(
+                select(SimRun).where(SimRun.id == LIVE_SIM_RUN_ID)
+            )
             run = result.scalar_one_or_none()
             if run is not None:
                 run.total_rows = 0
@@ -115,7 +125,10 @@ class SimulationEngine:
             self.tick_count = 0
             self.last_reading = None
             self.last_state = "IDLE"
-            logger.info("simulation reset: telemetry cleared, cycle reset")
+            logger.info(
+                "simulation reset: live telemetry (sim_run_id=%d) cleared, "
+                "cycle reset", LIVE_SIM_RUN_ID,
+            )
 
     def inject_failure(self, mode: str, onset_seconds: float) -> None:
         """Schedule a failure-mode degradation. Validation done by router.

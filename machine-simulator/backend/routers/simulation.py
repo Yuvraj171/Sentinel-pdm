@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.models import Telemetry
-from backend.simulation.engine import get_engine
+from backend.simulation.engine import LIVE_SIM_RUN_ID, get_engine
+from backend.simulation.fastgen import run_fast_gen
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,9 @@ async def stop_simulation():
 
 @router.post("/reset")
 async def reset_simulation(db: AsyncSession = Depends(get_db)):
-    """Stops the engine, drops all telemetry rows, resets cycle counters
-    — atomic under the engine lifecycle lock."""
+    """Stops the engine, drops live telemetry rows (sim_run_id=1 only —
+    fast-gen runs are preserved), resets cycle counters. Atomic under
+    the engine lifecycle lock."""
     engine = get_engine()
     await engine.reset(db)
     return {"message": "reset complete", "status": engine.status()}
@@ -72,6 +74,40 @@ async def clear_failure():
     return {"message": "failure cleared", "status": engine.status()}
 
 
+@router.post("/generate-training-data")
+async def generate_training_data(
+    duration_hours: float = Query(
+        ..., gt=0.0, le=8760.0,
+        description="Simulated hours of telemetry to generate. 1 year max.",
+    ),
+    failure_probability: float = Query(
+        0.15, ge=0.0, le=1.0,
+        description="Probability of a failure onset starting per simulated "
+                    "hour. CLAUDE.md spec is 0.05; 0.15 produces a denser "
+                    "dataset for ML training.",
+    ),
+):
+    """Fast-gen mode: generates a labelled training dataset into a fresh
+    SimRun (separate from live's sim_run_id=1). Returns counts when
+    complete. Expect ~60-90 seconds for duration_hours=168.
+
+    Cannot run while the live engine is running — call /stop first."""
+    engine = get_engine()
+    if engine.running:
+        raise HTTPException(
+            status_code=409,
+            detail="live engine is running; call /stop first",
+        )
+    try:
+        result = await run_fast_gen(
+            duration_hours=duration_hours,
+            failure_probability=failure_probability,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"message": "fast-gen complete", **result}
+
+
 @router.get("/status")
 async def get_status():
     return get_engine().status()
@@ -82,8 +118,13 @@ async def recent_telemetry(
     limit: int = Query(default=60, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ):
+    """Most recent rows from the live SimRun (sim_run_id=1). Fast-gen
+    runs are excluded — those are training data, not dashboard data."""
     result = await db.execute(
-        select(Telemetry).order_by(Telemetry.id.desc()).limit(limit)
+        select(Telemetry)
+        .where(Telemetry.sim_run_id == LIVE_SIM_RUN_ID)
+        .order_by(Telemetry.id.desc())
+        .limit(limit)
     )
     rows = list(reversed(result.scalars().all()))
     return [
