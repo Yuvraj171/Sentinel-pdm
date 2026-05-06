@@ -255,3 +255,39 @@ The Parquet export script (`scripts/export_training_data.py`) hit a non-obvious 
 - **Fast-gen and live mode share physics by construction, not by convention.** Both call `generate_normal_reading()` and `apply_failure_signature()` from the same module. There is no parallel implementation. Train-serve skew at the data layer was the headline risk for this sprint (D8); collapsing the implementations into one removes the failure mode entirely. Worth the small abstraction cost (engine.py imports the same functions; fastgen.py imports the same functions).
 
 ---
+
+## Day 7 — feature engineering, classifier training, anomaly detector — 2026-05-06
+
+**What happened:** Built the three ML training modules for `pdm-ai-engine`. Started by regenerating the training dataset at `failure_probability=0.5` to get a reliable test set — 85 failure events, 50,833 positive rows (8.77% positive rate) across 604,800 total rows. Previous generation at p=0.15 produced only 18 failure events, giving a test set too small for stable ROC-AUC estimates.
+
+`features.py` implements the D8 shared feature contract: 8 raw sensors pass through, plus 4 rolling 60s means, 3 rolling 60s stds, 3 rate-of-change features (diff over 10s lag), and 1 cross-feature (`power_per_voltage`). `prepare_training_frame()` wraps `compute_features()` and drops DOWN-state rows and warmup NaN rows — 579,375 usable rows after filtering.
+
+`train_classifier.py` trains three variants under MLflow: XGBoost (scale_pos_weight=10.9), Random Forest (class_weight='balanced'), and an ensemble averaging both probabilities. Time-based 80/20 split — mandatory because rolling-window features encode temporal history. Best variant: ensemble. ROC-AUC 0.9784, PR-AUC 0.9503, F1 0.912.
+
+`train_anomaly.py` trains Isolation Forest on normal-only rows (528,542). ROC-AUC 0.9313. Saves `reference_distribution.json` as the PSI drift baseline for Day 10.
+
+The UF_HIDDEN bug recurred 6+ times. Permanent mitigation: `touch .venv/.metadata_never_index` on both venvs, `fixvenv` alias in `~/.zshrc`.
+
+**Takeaway:**
+- **Regenerate when the test set is too small.** 18 failure events gives unstable ROC-AUC estimates. 85 events gives a defensible number. Two minutes of fast-gen time.
+- **Time-based split is non-negotiable for rolling-window features.** Random split leaks future rows into training via the rolling mean dependencies.
+- **The ensemble wins because XGBoost and RF make different errors.** Averaging probabilities is the cheapest ensemble — no stacking — and beat both individual models on every metric.
+
+---
+
+## Day 8-9 — live prediction pipeline + API endpoints — 2026-05-06
+
+**What happened:** Wired trained models into the live system. `predictor.py` loads both joblib bundles once at startup, calls `compute_features()` (D8 consistency), returns `{ai_risk_score, ai_anomaly_score, ai_status}`. `MODELS_DIR` anchored to `__file__` — no CWD dependency.
+
+`poll.py` infinite async loop at 1Hz: find newest `ai_status IS NULL` row, fetch 300 rows of history for rolling-window context, call predictor, UPDATE that one row. The NULL-frontier pattern is self-correcting — crash and restart lands on the correct next row automatically.
+
+First query version had a bug: fetched 300 rows `ORDER BY timestamp_sim DESC`, took `iloc[-1]` — this was a middle-of-history row, not the live frontier. Fix: explicitly query `WHERE ai_status IS NULL ORDER BY id DESC LIMIT 1` first.
+
+`api.py`: `/health`, `/status`, `/predict`, `/api/recent-predictions?limit=N`. Uvicorn PATH confusion after `source ~/.zshrc` — fix: always use `.venv/bin/python -m uvicorn`.
+
+**Takeaway:**
+- **NULL-frontier poll pattern is strictly better than offset-based pagination.** Idempotent on restart, no drift on out-of-order inserts.
+- **`MODELS_DIR` must be path-anchored, not CWD-relative.** Relative paths silently fail when the working directory changes.
+- **FastAPI lifespan is the right place for expensive one-time startup.** Loading 50MB+ joblib inside a request handler adds 1s latency per call.
+
+---
