@@ -64,3 +64,18 @@ async def predict(payload: SensorPayload):
     df = pd.DataFrame([payload.model_dump()])
     df["timestamp_sim"] = pd.Timestamp.utcnow()
     return predictor.predict(df)
+
+
+@app.get("/api/recent-predictions")
+async def recent_predictions(limit: int = 60):
+    async with async_session() as session:
+        result = await session.execute(text("""
+            SELECT id, timestamp_sim, ai_risk_score, ai_anomaly_score, ai_status,
+                   induction_power, quench_water_flow, quench_pressure, part_temp
+            FROM telemetry
+            WHERE ai_status IS NOT NULL
+            ORDER BY id DESC
+            LIMIT :limit
+        """), {"limit": limit})
+        rows = result.mappings().all()
+    return list(reversed([dict(r) for r in rows]))
