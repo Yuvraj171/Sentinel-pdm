@@ -12,6 +12,10 @@ from sentinel_pdm.config import settings
 from sentinel_pdm.database import async_session
 from sentinel_pdm.services.predictor import Predictor
 
+from sentinel_pdm.monitoring.drift import compute_psi, _load_reference
+from sentinel_pdm.training.features import compute_features
+
+
 predictor: Predictor | None = None
 
 
@@ -79,3 +83,22 @@ async def recent_predictions(limit: int = 60):
         """), {"limit": limit})
         rows = result.mappings().all()
     return list(reversed([dict(r) for r in rows]))
+
+
+@app.get("/api/drift")
+async def drift():
+    async with async_session() as session:
+        result = await session.execute(text("""
+            SELECT *
+            FROM telemetry
+            WHERE ai_status IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 300
+        """))
+        rows = result.mappings().all()
+    if not rows:
+        raise HTTPException(status_code=503, detail="No scored rows yet")
+    live_df = pd.DataFrame([dict(r) for r in rows])
+    live_df = compute_features(live_df)
+    reference = _load_reference()
+    return compute_psi(reference, live_df)
