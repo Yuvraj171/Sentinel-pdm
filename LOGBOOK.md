@@ -332,3 +332,89 @@ First query version had a bug: fetched 300 rows `ORDER BY timestamp_sim DESC`, t
 - **Pydantic gives you 422-style validation for free.** `test_predict_invalid_payload` sends a request with 7 missing fields and asserts a 422. We wrote zero validation code in the endpoint; the `SensorPayload(BaseModel)` class made it automatic. This is the part of FastAPI that's worth using deliberately — every input boundary should have a Pydantic model, both for the validation and so the OpenAPI schema is honest about what the endpoint accepts.
 
 ---
+
+## Day 12 — React Rules of Hooks violation (black screen on Maintenance tab) — 2026-05-10
+
+**What happened:** After wiring the persistent alert log into the Maintenance tab, the tab went completely black — no error message, no loading state, just an empty div. The browser console showed: `React has detected a change in the order of Hooks called by MaintenanceTab.` React then unmounted the component entirely and left the DOM empty.
+
+**Why it happened:** The hook call order in React must be identical on every render, unconditionally. The Maintenance tab had a loading guard — `if (!recentQ.data || recentQ.data.length === 0) { return <DashboardLoading />; }` — and `useAlertLog(...)` was called *after* that return. On the first render (no data yet), React counted N hooks. On the second render (data arrived), it counted N+1 because the early return was no longer taken. React detected the changed hook count and threw. Because there was no error boundary above the tab, React unmounted the subtree silently.
+
+The mistake is subtle: the loading guard looked like a "nothing happens yet" early return, so it felt safe to put hooks below it. But React doesn't know about "nothing happens" — it only sees a different number of hook calls on two consecutive renders.
+
+**How we fixed it:** Moved `useAlertLog` (and its dependencies: `earlyRisk`, `earlyMachineState`, `earlyState`) above the loading guard. All hooks now run unconditionally on every render.
+
+```jsx
+// WRONG — hook below early return:
+if (!recentQ.data) return <DashboardLoading />;
+const alertLog = useAlertLog(...); // skipped on first render
+
+// RIGHT — all hooks before any return:
+const alertLog = useAlertLog(...);
+if (!recentQ.data) return <DashboardLoading />;
+```
+
+**Takeaway:**
+- **Every hook must be above every conditional return, always.** This is not a style preference — React's reconciler depends on hook calls being counted in the same order on every render. An early return is a conditional branch; a hook below it is a conditional hook. The `react-hooks/rules-of-hooks` eslint rule catches this at write time. Without it, the failure mode is a runtime unmount that looks like a blank page, not an error.
+- **Loading guards are not "nothing". They are conditional renders.** The mental model "I'll put hooks below the guard because the guard is just a loading spinner" is wrong. Every `if (...) return` inside a component is a branch that can short-circuit hook evaluation. Hard rule: all hooks at the top, all conditionals below.
+- **Silent failures are the worst kind.** The component didn't throw; it was just gone. React logs the violation to the console in development mode, but in production the result is simply "the component disappeared." An error boundary above each tab would have shown a recoverable error state instead of a blank screen.
+
+---
+
+## Day 12 — `parts_per_hour` returning a raw count instead of a rate (cycle time 124s vs 18s) — 2026-05-10
+
+**What happened:** The Operator tab showed a cycle time of `124.1s` after repair. The real cycle time is ~18s. The dashboard derives cycle time as `3600 / parts_per_hour`, so `3600 / 29 ≈ 124s` — meaning `parts_per_hour` was 29 instead of ~200.
+
+**Why it happened:** The `/api/production` endpoint computed:
+```python
+parts_in_hour = ok_in_hour + ng_in_hour   # e.g. 29 parts in the last 3600-row window
+parts_per_hour = parts_in_hour             # BUG: count, not rate
+```
+The window is always 3600 rows, but those rows span both running and DOWN time. After a repair with minimal history, the window might contain 3000 DOWN rows and 600 running rows. 29 parts in 600 running seconds is 29 × (3600/600) = 174 parts/hr — but the API was returning 29 directly. The error scales with downtime: the more downtime in the window, the further off the number.
+
+**How we fixed it:**
+```python
+running_rows = max(1, hour["row_count"] - hour["down_rows"])
+parts_per_hour = round(parts_in_hour * 3600 / running_rows)
+```
+
+**Takeaway:**
+- **A count dressed up as a rate is a type error the compiler can't catch.** Both the old and new values were integers; nothing in Python flagged which was correct. Naming helps: `parts_in_hour` (count) vs `parts_per_hour` (rate). When names lie, every downstream consumer is wrong.
+- **Rates over windows with varying availability must be normalised by active time, not wall-clock time.** Dividing total parts by total elapsed time when some of that time was downtime gives the wrong answer. The denominator must exclude unavailable periods — same principle as OEE.
+- **Derived metrics cascade errors.** One wrong API field corrupted three UI elements: Parts/hr tile, Cycle time tile, Cycle time delta badge. All three looked plausible in isolation. Trace the dependency graph before assuming a downstream number is independently trustworthy.
+
+---
+
+## Day 12 — Repair endpoint returning 409 when tick loop had crashed — 2026-05-10
+
+**What happened:** After an unexpected exception inside `_tick()` caused the loop to crash, the machine entered a dead state: `cycle.state = DOWN`, `running = False`. The operator hit the Repair button and got: `Repair failed: 409 Conflict — engine is not running; call /start or /reset first`. The dashboard showed the HALTED banner with no recovery path.
+
+**Why it happened:** The repair endpoint checked `engine.running` and refused with a 409 if the engine wasn't running — a reasonable guard when the engine was stopped intentionally. But `running` goes `False` both on deliberate `/stop` and on tick-loop crash. The two cases look identical from the flag's perspective but require different operator responses: "stopped intentionally" should require an explicit restart; "crashed mid-run" should auto-recover transparently. The endpoint had no way to distinguish them, so it applied the conservative behaviour in both cases.
+
+**How we fixed it:** The repair endpoint now auto-starts the engine when it finds `cycle.state = DOWN` but `running = False`:
+```python
+changed = engine.repair()
+if not engine.running and changed:
+    await engine.start()  # transparent crash recovery
+```
+
+**Takeaway:**
+- **User-facing endpoints should recover from recoverable states, not just report them.** A 409 with "call /start first" is correct for a developer reading API docs. It is wrong UX for an operator whose only interface is a dashboard button. Design for the most constrained caller.
+- **"Not running" is not a single state.** Stopped (deliberate) and crashed (exception) are both `running=False` but need different recovery paths. When one flag value maps to two correct responses, the flag is the wrong representation.
+- **Background task crashes must be observable.** The loop caught the exception, set `running=False`, and called `cycle.fail()` — correct defensively, but left no evidence of why it crashed. `logger.exception("tick failed")` gives a full traceback before the next user action surfaces the symptom.
+
+---
+
+## Day 12 — Cross-service constant duplication (`COIL_EXPECTED_PARTS = 5000`) — 2026-05-10
+
+**What happened:** During a codebase audit, `COIL_EXPECTED_PARTS = 5000` was found defined independently in both `engine.py` (simulator) and `api.py` (AI engine). The two services share a Postgres database but cannot import from each other. Risk: changing the coil spec in the simulator leaves the AI engine's `coil_life.expected` and `pct_remaining` calculation silently wrong.
+
+**Why it happened:** Both files were written independently and the constant was small enough that duplication seemed harmless. But the moment there are two copies, they can diverge — and the divergence is invisible until someone actually changes one. No compiler, no test, no lint rule catches "constant in service A no longer matches service B."
+
+**How we fixed it:** Created a `machine_config` table (Alembic migration `a3f8e2c91b05`) with a key/value schema. The simulator writes `coil_expected_parts=5000` to this table on every `start()` call. The AI engine reads the value from `machine_config` in `/api/production`, with a fallback of 5000 for first-boot safety. The constant is now defined once in the simulator; the DB is the single source of truth for cross-service reads.
+
+**Takeaway:**
+- **Two services that share a database share more than rows — they share domain constants.** When a value governs calculations in both services, it belongs in the shared medium (the DB), not duplicated in both codebases. `machine_config` is the lightweight way to do this without a shared package or a service-to-service API call.
+- **"It's just a number" is how duplicates become bugs.** The value is safe today because nobody has changed it. It becomes dangerous the first time someone updates the coil spec for a new production run. The fix cost was one migration and one SQL read. The prevention value: whoever changes `COIL_EXPECTED_PARTS` in the simulator propagates it to the AI engine automatically on next start.
+- **Duplication across service boundaries is categorically different from duplication within a service.** Within one codebase, a linter or search finds both copies. Across two services, nothing connects them. Treat any value two services must agree on as a contract point, not a convenience copy.
+
+---
