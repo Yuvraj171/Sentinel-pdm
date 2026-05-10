@@ -97,5 +97,19 @@ class Telemetry(Base):
     )
 
 
+class MachineConfig(Base):
+    """Shared configuration written by the simulator, read by the AI engine.
+
+    Key-value pairs that represent single-source-of-truth constants for values
+    that both services need (e.g. coil_expected_parts). The simulator writes on
+    startup; the AI engine reads via raw SQL so it doesn't need to import this
+    model directly.
+    """
+    __tablename__ = "machine_config"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+
+
 # High-frequency time-series queries: dashboard polls by timestamp.
 Index("idx_telemetry_timestamp", Telemetry.timestamp_sim)

@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy import select
 
 from backend.database import AsyncSessionLocal
-from backend.models import SimRun, Telemetry
+from backend.models import MachineConfig, SimRun, Telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,12 @@ class TelemetryWriter:
 async def get_or_create_live_sim_run() -> int:
     """The live dashboard always writes to a single SimRun (id=1).
     Fast-gen runs create their own SimRun per invocation (id >= 2).
+
+    Also upserts machine_config so the AI engine always reads the authoritative
+    coil_expected_parts value written here rather than a separate hardcoded constant.
     """
     # Imported here to avoid circular import (engine -> persistence -> engine).
-    from backend.simulation.engine import LIVE_SIM_RUN_ID
+    from backend.simulation.engine import COIL_EXPECTED_PARTS, LIVE_SIM_RUN_ID
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
@@ -56,4 +59,13 @@ async def get_or_create_live_sim_run() -> int:
                 )
                 session.add(run)
                 logger.info("created live SimRun id=%d", LIVE_SIM_RUN_ID)
+
+            # Upsert authoritative config values so the AI engine can read them
+            # without duplicating constants across two services.
+            cfg = await session.get(MachineConfig, "coil_expected_parts")
+            if cfg is None:
+                session.add(MachineConfig(key="coil_expected_parts", value=str(COIL_EXPECTED_PARTS)))
+            else:
+                cfg.value = str(COIL_EXPECTED_PARTS)
+
             return run.id

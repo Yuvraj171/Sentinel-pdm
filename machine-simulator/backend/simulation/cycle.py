@@ -16,6 +16,9 @@ class CycleState:
     state: str = IDLE
     elapsed_in_state: int = 0
     cycle_count: int = 0
+    # True only on the single tick where QUENCH -> IDLE transitions, i.e. the
+    # tick a part finished. Lets the engine decide OK vs NG that exact tick.
+    cycle_just_completed: bool = False
 
 
 class MachineCycle:
@@ -25,6 +28,10 @@ class MachineCycle:
         self.s = CycleState()
 
     def advance(self) -> CycleState:
+        # Reset the one-shot flag at the start of each tick so the engine sees
+        # it true on exactly the completion tick.
+        self.s.cycle_just_completed = False
+
         if self.s.state == DOWN:
             return self.s
 
@@ -36,6 +43,7 @@ class MachineCycle:
             self._transition(QUENCH)
         elif self.s.state == QUENCH and self.s.elapsed_in_state >= QUENCH_DURATION_S:
             self.s.cycle_count += 1
+            self.s.cycle_just_completed = True
             self._transition(IDLE)
 
         return self.s
@@ -53,6 +61,17 @@ class MachineCycle:
     @property
     def state(self) -> str:
         return self.s.state
+
+    @property
+    def phase_duration(self) -> int:
+        """Total seconds the current phase is supposed to last. 0 for DOWN."""
+        if self.s.state == IDLE:
+            return IDLE_DURATION_S
+        if self.s.state == HEATING:
+            return HEATING_DURATION_S
+        if self.s.state == QUENCH:
+            return QUENCH_DURATION_S
+        return 0
 
     @property
     def progress(self) -> float:

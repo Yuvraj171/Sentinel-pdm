@@ -68,10 +68,45 @@ async def inject_failure(
 async def clear_failure():
     """Cancel any active failure-mode degradation. Sensors return to
     baseline immediately; cycle state is unchanged (no auto-recovery
-    from DOWN — call /reset for that)."""
+    from DOWN — call /repair or /reset for that)."""
     engine = get_engine()
     engine.clear_failure()
     return {"message": "failure cleared", "status": engine.status()}
+
+
+@router.post("/repair")
+async def repair_machine():
+    """Operator-style recovery: clear any active failure AND lift the cycle
+    out of DOWN back to IDLE. Counters (coil life, batch, ok/ng totals)
+    are preserved — this is "the machine was fixed and resumed," not
+    "we replaced the line."
+
+    If the tick loop has crashed (engine.running=False, e.g. after an
+    unhandled exception in _tick), auto-restart the engine so the operator
+    can resume without having to know about internal state. Counters will
+    reset in that case (same as /start), which is acceptable for crash
+    recovery.
+
+    Idempotent. Returns whether the call changed anything in `repaired`.
+    """
+    engine = get_engine()
+    if not engine.running:
+        # Tick loop crashed — restart rather than rejecting so the operator
+        # gets a working simulator back without a manual /start call.
+        await engine.start()
+        return {
+            "message": "engine was offline and has been restarted (counters reset)",
+            "repaired": True,
+            "restarted": True,
+            "status": engine.status(),
+        }
+    repaired = engine.repair()
+    return {
+        "message": "repaired" if repaired else "nothing to repair",
+        "repaired": repaired,
+        "restarted": False,
+        "status": engine.status(),
+    }
 
 
 @router.post("/generate-training-data")
