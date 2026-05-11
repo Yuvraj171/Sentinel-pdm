@@ -2,6 +2,8 @@
 // production state. Mocked for now: alert history, alert "why" feature
 // contributions, recipe context narrative.
 
+import { Suspense, lazy } from 'react';
+
 import { useRecentPredictions, useDrift, useProduction } from '../lib/api.js';
 import { statusFromRiskAndState, statusFromPsi, statusTokens } from '../lib/status.js';
 import { CURRENT_RECIPE } from '../lib/mock.js';
@@ -17,6 +19,8 @@ import DashboardLoading from '../components/DashboardLoading.jsx';
 import SensorChart from './SensorChart.jsx';
 import SparklineStrip from './SparklineStrip.jsx';
 import AlertsList from './AlertsList.jsx';
+
+const Scene3D = lazy(() => import('../components/Machine3D/index.jsx'));
 
 export default function MaintenanceTab({ accent = '#06b6d4', intensity = 'full' }) {
   const recentQ = useRecentPredictions(60);
@@ -136,6 +140,34 @@ export default function MaintenanceTab({ accent = '#06b6d4', intensity = 'full' 
         </div>
         <div className="mx-schema-card">
           <FlowDiagram state={state} accent={accent} intensity={intensity} riskValue={risk} />
+        </div>
+      </section>
+
+      <section className="mx-twin-wrap">
+        <div className="mx-section-head">
+          <div className="mx-section-eyebrow">DIGITAL TWIN · LIVE</div>
+          <div className="mx-section-title">Cell IH-04 — what the machine is doing right now</div>
+          <div className="mx-section-sub">
+            Coil glow follows phase and risk · conveyor stops on DOWN · sparks appear at CRITICAL
+          </div>
+        </div>
+        <div className="mx-twin-card">
+          <Suspense fallback={<div className="mx-twin-fallback">Loading 3D scene…</div>}>
+            <Scene3D
+              compact
+              machineState={machineState}
+              riskScore={risk}
+              aiStatus={state}
+              showSensors
+              sensorValues={{
+                power:     latest.induction_power     != null ? Math.round(latest.induction_power).toString()     : '—',
+                part_temp: latest.part_temp           != null ? Math.round(latest.part_temp).toString()           : '—',
+                flow:      latest.quench_water_flow   != null ? Math.round(latest.quench_water_flow).toString()   : '—',
+                pressure:  latest.quench_pressure     != null ? latest.quench_pressure.toFixed(1)                 : '—',
+                vibration: latest.vibration           != null ? latest.vibration.toFixed(1)                       : '—',
+              }}
+            />
+          </Suspense>
         </div>
       </section>
 
