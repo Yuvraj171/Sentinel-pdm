@@ -418,3 +418,184 @@ if not engine.running and changed:
 - **Duplication across service boundaries is categorically different from duplication within a service.** Within one codebase, a linter or search finds both copies. Across two services, nothing connects them. Treat any value two services must agree on as a contract point, not a convenience copy.
 
 ---
+
+## Day 14 — Local Docker builds for a remote target keep filling the disk — 2026-05-17
+
+**What happened:** First Cloud Run deploy stalled because `docker buildx build --platform linux/amd64 --push` for the AI engine repeatedly exhausted Docker Desktop's virtual disk. Each rebuild redownloaded xgboost + scikit-learn + their transitive deps, including a 300 MB `nvidia-nccl-cu12` CUDA package that comes by default with xgboost. After several prune-rebuild cycles every attempt still ended in `no space left on device` inside the BuildKit container.
+
+**Why it happened:** Mac is ARM, Cloud Run requires AMD64. Cross-architecture buildx means QEMU emulation, which is slow and disk-heavy. Layer caching across emulated builds is unreliable because Python wheels with C extensions don't deduplicate well across architectures. Docker Desktop's virtual disk has a fixed ceiling — each prune-then-rebuild cycle eventually loses to incremental layer accumulation. Local Docker is the wrong tool for heavy ML images that only need to run remotely.
+
+**How we fixed it:** Switched to `gcloud builds submit --tag=...`. Cloud Build runs `docker build` on a GCP VM (linux/amd64 native, effectively unlimited disk), pushes straight to Artifact Registry. Zero bytes touch the Mac. Each build takes ~4-5 min, costs ~$0.003 (well inside the free 120 min/day allowance). First Cloud Build succeeded on the first try. Also pinned `xgboost[cpu]` in `pyproject.toml` to skip the CUDA stack — useful regardless of where you build.
+
+**Takeaway:**
+- **Local Docker is for images you'll run locally.** When the deploy target is a different architecture and the image is heavy, building in the cloud is cheaper, faster, and removes your laptop from the supply chain. The reflex "I have Docker, I'll build locally" is wrong for cloud deploys.
+- **Pruning is a symptom, not a strategy.** When you prune more than once for the same workflow, the workflow is structurally wrong — you're not "managing disk", you're losing a race.
+- **Pin CPU-only variants of ML packages on cloud targets without GPUs.** `xgboost[cpu]` skips the CUDA stack; `torch+cpu` does the same. Every CUDA dep on a CPU-only target is dead weight that costs build time, disk, and cold-start memory.
+
+---
+
+## Day 14 — Cloud Run runs one process; standalone workers don't exist — 2026-05-17
+
+**What happened:** After first AI engine deploy `/health` returned 200 with `models_loaded:true`, but `/status` returned `503 No predictions yet` forever. The poll loop appeared dead even though the same code ran fine under `docker compose` locally.
+
+**Why it happened:** Locally we ran two processes per service: `uvicorn` for the API and `python -m sentinel_pdm.pipeline.poll` for the prediction loop. Docker Compose orchestrated both. **Cloud Run runs exactly ONE process per container — the one in `CMD`.** The poll-loop process simply never started in production; only uvicorn did. The deployed `/status` was telling the truth: no predictions, because nothing was predicting.
+
+**How we fixed it:** Moved the poll loop into the FastAPI lifespan as a background asyncio task:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global predictor
+    predictor = Predictor()
+    task = asyncio.create_task(run_poll_loop(predictor))
+    yield
+    task.cancel()
+    try: await task
+    except asyncio.CancelledError: pass
+```
+
+One container, one process, two concurrent asyncio tasks (uvicorn's request handlers + the poll loop). Both share the same event loop and DB connection pool. Cancel-on-shutdown handling so SIGTERM doesn't leak the task on revision rollovers.
+
+**Takeaway:**
+- **A multi-process Docker Compose layout doesn't survive `gcloud run deploy`.** Cloud Run, Fly Machines, App Runner, and most "serverless container" platforms run exactly one process per instance. Background work either fits inside that process (asyncio task, thread) or needs a separate service.
+- **`asyncio.create_task` in a FastAPI lifespan is the canonical way to run a long-lived background loop next to the API.** Cancel-on-shutdown is required so SIGTERM doesn't leak the task.
+- **Dev-time helper messages can mislead in prod.** The dashboard hint "open a terminal and run `python -m sentinel_pdm.pipeline.poll`" was correct for local dev and actively wrong on Cloud Run. Diagnostic messages aimed at the user should account for which environment the app is in, or they'll be a red herring forever.
+
+---
+
+## Day 14 — Cloud Run CPU throttling silently kills background loops — 2026-05-17
+
+**What happened:** After moving the poll loop into the lifespan, scoring still lagged badly. The dashboard's "no scored rows in N seconds" gap grew while no one was watching, then caught up briefly when curl traffic arrived. Over a 16-hour idle window, the AI engine scored only ~10% of the rows the simulator wrote.
+
+**Why it happened:** Cloud Run's default mode is **"CPU only during request processing."** The container stays in memory (with `--min-instances=1`) but its CPU is throttled to near-zero between HTTP requests. Background asyncio tasks have no inbound request to "ride on" — they don't get scheduled to run meaningfully. Every dashboard poll briefly woke the container, the loop scored a burst of rows, then it went back to sleep. Sustained 1Hz scoring required sustained CPU, which the default Cloud Run config wasn't giving us.
+
+**How we fixed it:** Added `--no-cpu-throttling` (a.k.a. "always-allocated CPU") to the AI engine deploy. CPU stays allocated to the instance 24/7. Cost rises modestly (~$20/month per always-on small instance) but background work runs continuously. Confirmed by isolating a 60-second window where no curl traffic touched the engine — it still scored 6-7 rows/sec from the backlog.
+
+**Takeaway:**
+- **`--min-instances=1` keeps the container in memory; `--no-cpu-throttling` keeps the CPU running.** They're orthogonal. Any process that does work outside the request path (cron-like loops, queue consumers, file watchers, websocket pumps) needs both. Setting only one is a deceptive half-fix.
+- **Default Cloud Run is request-driven.** Background work fights the platform unless you explicitly opt out. Alternative: move background work to Cloud Scheduler + Pub/Sub, which is more Cloud Run-idiomatic but more setup.
+- **When a system "speeds up when I look at it", suspect CPU/event-loop scheduling.** That fingerprint is "the platform only gives CPU during my observation." It's the closest thing to a Heisenbug a server can produce.
+
+---
+
+## Day 14 — `statement_cache_size=0` to survive Supabase pgBouncer — 2026-05-17
+
+**What happened:** First request to `/api/production` after the Supabase migration returned `500 Internal Server Error — reset failed`. The asyncpg traceback showed `asyncpg.exceptions.DuplicatePreparedStatementError: prepared statement "__asyncpg_stmt_1__" already exists`. Subsequent requests sometimes worked, sometimes didn't — flaky in a way that pointed to shared state somewhere.
+
+**Why it happened:** Supabase fronts Postgres with **pgBouncer in transaction-mode pooling**. asyncpg, by default, names and caches prepared statements per connection. In transaction mode, pgBouncer reuses *backend* connections across clients between transactions — but each client thinks it owns its own connection. Client A creates `__asyncpg_stmt_1__`, finishes its transaction, pgBouncer hands the same backend connection to client B, B tries to create `__asyncpg_stmt_1__` again on what it thinks is a fresh connection — collision. Local Postgres has no pooler, so the bug was invisible in dev.
+
+**How we fixed it:** Set `statement_cache_size=0` in both services' `create_async_engine` calls:
+
+```python
+engine = create_async_engine(
+    settings.database_url,
+    connect_args={"statement_cache_size": 0},
+)
+```
+
+With caching off, asyncpg sends every query as a one-shot prepare-execute-deallocate cycle — slower per-query (≈10 ms vs ≈1 ms), but compatible with transaction-mode pooling. At our 1 Hz traffic the throughput cost is invisible.
+
+**Takeaway:**
+- **Connection poolers and per-connection caches don't mix.** Any per-connection state (prepared statements, server-side cursors, temp tables, session vars) is hostile to transaction-mode pooling. When using a pooler, treat each query as if it lands on a different backend.
+- **Supabase's "session mode" pooler (port 5432) avoids this but at lower concurrency.** Session mode for dev tools like Alembic migrations; transaction mode for app runtime — and configure the client accordingly.
+- **Local Postgres is a deceptive proxy for production-on-pgBouncer.** Tests that pass locally can fail on Supabase the first time concurrent traffic shares a pooled connection. At least one CI test should hit a pooled DB before any Supabase deploy.
+
+---
+
+## Day 14 — `__file__` paths break when the package is pip-installed — 2026-05-17
+
+**What happened:** AI engine container booted but immediately crashed loading models: `FileNotFoundError: /usr/local/lib/python3.11/site-packages/sentinel_pdm/models/classifier.joblib`. The models were baked into the image at `/app/models/`, not where the code was looking.
+
+**Why it happened:** The predictor resolved its models directory with `pathlib.Path(__file__).resolve().parents[3] / "models"`. In editable installs (`pip install -e .`), `__file__` points back into the source tree, so `parents[3]` correctly resolves to the repo root where `models/` lives. In a real `pip install .` build (which is what the Dockerfile does), `__file__` points inside `site-packages`, and `parents[3]` walks up to `/usr/local/lib/python3.11` — there's no `models/` there. Same code, different deployment mode, different filesystem semantics.
+
+**How we fixed it:** Added a `MODELS_DIR` env var with the existing `__file__` path as a fallback:
+
+```python
+MODELS_DIR = pathlib.Path(
+    os.environ.get(
+        "MODELS_DIR",
+        str(pathlib.Path(__file__).resolve().parents[3] / "models"),
+    )
+)
+```
+
+Dockerfile copies models into `/app/models/`; the Cloud Run deploy sets `MODELS_DIR=/app/models`. Local dev still works because the env var is unset and the fallback resolves to the repo's `models/` dir.
+
+**Takeaway:**
+- **`__file__` is brittle for resource paths.** It works in editable installs and breaks in real installs, with the same code. For any file needed at runtime, source the path from config/env rather than from where the code happens to live on disk.
+- **`importlib.resources` is the right answer for read-only package data.** If the file genuinely ships *inside* the package, `importlib.resources.files("pkg")` is the path-independent way to find it. For external artifacts (like trained models that you might swap out), an env var is more honest about that boundary.
+- **Editable installs hide deployment bugs.** Anything that works in `pip install -e .` but breaks in `pip install .` is, by definition, only visible once you Dockerize. Worth running both modes in CI for any package shipping resource files.
+
+---
+
+## Day 14 — SPA routes 404 the moment you refresh on them — 2026-05-17
+
+**What happened:** Dashboard loaded fine at `/`, but pasting `/dashboard?tab=maintenance` directly into the address bar returned `{"detail":"Not Found"}` as JSON. Same for any page refresh on a non-root URL. Local Vite dev never showed the bug.
+
+**Why it happened:** The simulator backend served the frontend via `app.mount("/", StaticFiles(directory="static", html=True))`. StaticFiles with `html=True` serves `index.html` when a path resolves to a directory, but it returns 404 for paths that don't exist on disk. React Router routes like `/dashboard` only exist client-side — the backend has no `dashboard` file or folder, so it 404s before React even loads, and React Router never gets a chance to handle the route. Vite's dev server has SPA fallback built in (`historyApiFallback`), so this was invisible in dev.
+
+**How we fixed it:** Replaced the StaticFiles mount with a single catch-all GET handler registered *after* all API routers:
+
+```python
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa_catch_all(full_path: str, request: Request):
+    candidate = _static_dir / full_path
+    if full_path and candidate.is_file():
+        return FileResponse(candidate)
+    # Only fall back to index.html for browser HTML requests; JSON clients get 404.
+    if "text/html" not in request.headers.get("accept", ""):
+        raise HTTPException(status_code=404)
+    return FileResponse(_static_dir / "index.html")
+```
+
+The `Accept`-header check is the non-obvious piece. Without it, a typo'd API URL would silently return HTML, and the calling JSON client would choke on `Unexpected token <` instead of getting a clean 404. With it, browsers get `index.html` for unknown paths, JSON clients get proper 404s, and registered API routes take priority because they're matched before the catch-all.
+
+**Takeaway:**
+- **SPA fallback is a backend concern, not a frontend concern.** React Router is fully client-side; the server has to send it a working HTML shell for any URL the user might land on. Default StaticFiles doesn't do this — every framework needs an explicit fallback rule.
+- **Catch-alls that don't discriminate by content type create silent JSON-parse bugs.** Always gate "fall back to index.html" on `Accept: text/html`. Otherwise a wrong API URL returns HTML, `JSON.parse()` chokes on `<`, and the visible error reads as "syntax error" rather than "wrong URL".
+- **A working local dev server is not a deployment validator.** Vite's `historyApiFallback` made this bug invisible until a real backend sat in front. Any dev tooling that silently substitutes for production behavior is a future incident waiting on the day you deploy.
+
+---
+
+## Day 14 — CORS allowlist missing the production origin (the bug curl can't see) — 2026-05-17
+
+**What happened:** After every other deployment fix landed and `curl` consistently showed healthy data, the deployed dashboard still showed "No predictions arriving in N seconds" — with N counting up indefinitely. Backend metrics looked fine. The poll loop was scoring rows in real-time. No errors in any service log. I spent hours diagnosing the wrong system before checking the browser console.
+
+**Why it happened:** The AI engine's `CORSMiddleware` had this allowlist:
+
+```python
+allow_origins=[
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    "http://localhost:5174", "http://127.0.0.1:5174",
+],
+allow_credentials=True,
+```
+
+With `allow_credentials=True`, the CORS spec **forbids** wildcard `*` — every allowed origin must be listed explicitly. The production simulator origin (`https://sentinel-simulator-69435327302.asia-northeast1.run.app`) was missing. The browser sent requests with the correct `Origin` header, the AI engine returned data with HTTP 200, but **without** the `Access-Control-Allow-Origin` header. The browser then refused to hand the response to JavaScript.
+
+The frontend's TanStack Query saw the fetch reject. Its `placeholderData: keepPreviousData` policy kept the UI in its empty initial state. The "in N seconds" counter in the dashboard was `Date.now() - mountedAt` — wall-clock time since the page mounted, *not* a real server-side gap. The message led directly to the wrong diagnosis ("poll loop isn't running") even though the poll loop was perfectly fine.
+
+curl never saw the bug because **curl ignores CORS entirely**. CORS is enforced by browsers; the AI engine's response was byte-identical between curl and the browser. Every diagnostic I ran for hours was structurally blind to the failure mode. The browser DevTools console showed the bug instantly: `Access to fetch at … has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.`
+
+**How we fixed it:** Moved the allowlist to a settings field with a comma-separated env var override, defaulting to a list that includes both production Cloud Run URLs (project-number and hash style) alongside the localhost dev origins:
+
+```python
+cors_allow_origins: list[str] = Field(
+    default_factory=lambda: [
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+        "https://sentinel-simulator-69435327302.asia-northeast1.run.app",
+        "https://sentinel-simulator-o7yiepxhnq-an.a.run.app",
+    ]
+)
+```
+
+Then `allow_origins=settings.cors_allow_origins` in api.py. Future URL changes need only a `--set-env-vars="CORS_ALLOW_ORIGINS=..."` override on deploy, not a rebuild.
+
+**Takeaway:**
+- **curl is not a substitute for browser testing for any cross-origin API.** CORS is the largest production-only failure mode I know of. Anything using `fetch()` from a different origin than the backend needs verification in actual browser DevTools, every time. Build the habit: when a deployed UI says "no data" and curl says "data is fine", open DevTools *before* doing anything else.
+- **`allow_credentials=True` + wildcard origin is forbidden by CORS spec.** That's why teams reach for explicit allowlists, and that's why those allowlists rot the moment the production URL changes. Drive them from env vars; never hardcode production URLs in source.
+- **Misleading error messages are worse than no error message.** The dashboard's "poll.py isn't running — open a terminal and run X" sent me hunting for backend bugs that didn't exist for hours. Diagnostic copy has to distinguish "no data because the backend stalled" from "no data because the request was blocked." Otherwise the message actively obstructs the debug.
+- **Browser-side errors only surface in browser-side tools.** CORS rejections never reach backend logs, curl, or automated `/health` probes. A bug invisible to your existing observability is the bug that costs you a day.
+
+---
