@@ -95,6 +95,12 @@ Trained on 100k+ rows of fast-gen simulator data with ~85/15 normal/failure clas
 
 False positive rate <1%, inference ~50 ms per row. Full metrics + confusion matrices: [pdm-ai-engine/models/model_performance_card_v1.md](pdm-ai-engine/models/model_performance_card_v1.md). Raw JSON: [pdm-ai-engine/models/classifier_metrics.json](pdm-ai-engine/models/classifier_metrics.json).
 
+Every training run is tracked in MLflow (experiment name `sentinel-pdm`, local file backend at `pdm-ai-engine/mlruns/`):
+
+![MLflow run comparison — hyperparameters and metrics across xgboost / random_forest / ensemble](docs/mlflow-comparison.png)
+
+![MLflow parallel coordinates of ROC-AUC across the three classifier variants](docs/mlflow-params.png)
+
 ---
 
 ## Tech stack
