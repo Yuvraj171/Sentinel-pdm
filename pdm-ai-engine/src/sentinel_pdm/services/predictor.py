@@ -1,6 +1,7 @@
 """Model loader and inference — called by both poll.py and api.py."""
 from __future__ import annotations
 
+import os
 import pathlib
 
 import joblib  # type: ignore
@@ -8,8 +9,14 @@ import pandas as pd
 
 from sentinel_pdm.training.features import FEATURES, compute_features
 
-# Anchored to this file's location: services/ -> sentinel_pdm/ -> src/ -> pdm-ai-engine/models/
-MODELS_DIR = pathlib.Path(__file__).resolve().parents[3] / "models"
+# MODELS_DIR env var is set in Docker to /app/models.
+# Locally (editable install) falls back to the repo's models/ directory.
+MODELS_DIR = pathlib.Path(
+    os.environ.get(
+        "MODELS_DIR",
+        str(pathlib.Path(__file__).resolve().parents[3] / "models"),
+    )
+)
 
 
 class Predictor:

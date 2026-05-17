@@ -1,6 +1,7 @@
 """FastAPI app — /health, /status, /predict endpoints."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import pandas as pd
@@ -26,6 +27,7 @@ _COIL_EXPECTED_PARTS_FALLBACK = 5000
 LIVE_SIM_RUN_ID = 1
 
 from sentinel_pdm.monitoring.drift import compute_psi, _load_reference
+from sentinel_pdm.pipeline.poll import run_poll_loop
 from sentinel_pdm.training.features import compute_features
 
 
@@ -36,19 +38,20 @@ predictor: Predictor | None = None
 async def lifespan(app: FastAPI):
     global predictor
     predictor = Predictor()
+    task = asyncio.create_task(run_poll_loop(predictor))
     yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(title="Sentinel PdM AI Engine", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

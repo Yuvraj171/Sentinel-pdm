@@ -32,6 +32,27 @@ class Settings(BaseSettings):
     drift_psi_critical_threshold: float = 0.2
     drift_batch_size: int = 300
 
+    # CORSMiddleware allow_origins. allow_credentials=True forbids "*", so the
+    # production simulator origin must be listed explicitly. Override via the
+    # CORS_ALLOW_ORIGINS env var (comma-separated) when the Cloud Run URL changes.
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
+            "https://sentinel-simulator-69435327302.asia-northeast1.run.app",
+            "https://sentinel-simulator-o7yiepxhnq-an.a.run.app",
+        ]
+    )
+
+    @field_validator("cors_allow_origins", mode="before")
+    @classmethod
+    def split_cors_origins(cls, v):
+        if isinstance(v, str):
+            return [o.strip() for o in v.split(",") if o.strip()]
+        return v
+
     @field_validator("database_url")
     @classmethod
     def reject_sqlite(cls, v: str) -> str:

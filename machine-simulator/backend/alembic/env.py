@@ -1,94 +1,67 @@
+import os
 from pathlib import Path
 import sys
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
+from sqlalchemy import create_engine, pool
 from alembic import context
 
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
 config = context.config
-
-# --- Sentinel-PdM wiring (Day 3, Task 1) -----------------------------------
-# Make `backend` importable: env.py runs from backend/, so we add the
-# machine-simulator root (two parents up) to sys.path before importing.
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.config import settings  # noqa: E402
 from backend.database import Base  # noqa: E402
-from backend import models  # noqa: E402,F401  # registers tables on Base.metadata
+from backend import models  # noqa: E402,F401
 
-# Inject DATABASE_URL into Alembic config. We strip the asyncpg driver suffix
-# because Alembic's online migration path uses a sync engine; SQLAlchemy will
-# resolve the bare postgresql:// URL to psycopg2 (installed for this purpose).
-sync_url = settings.database_url.replace(
-    "postgresql+asyncpg://", "postgresql://")
-config.set_main_option("sqlalchemy.url", sync_url)
-# ---------------------------------------------------------------------------
+# MIGRATION_DATABASE_URL bypasses configparser interpolation — required when
+# the password contains special characters (@, %) that configparser rejects.
+# Falls back to DATABASE_URL (asyncpg prefix stripped for sync psycopg2 engine).
+_migration_url = os.environ.get("MIGRATION_DATABASE_URL")
+sync_url = _migration_url or settings.database_url.replace(
+    "postgresql+asyncpg://", "postgresql://"
+)
 
-
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
 target_metadata = Base.metadata
-
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode.
-
-    This configures the context with just a URL
-    and not an Engine, though an Engine is acceptable
-    here as well.  By skipping the Engine creation
-    we don't even need a DBAPI to be available.
-
-    Calls to context.execute() here emit the given string to the
-    script output.
-
-    """
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=sync_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode.
+    # Build engine from URL object. When MIGRATION_DATABASE_URL is set we use
+    # URL.create() with the password as a separate arg so SQLAlchemy never has
+    # to parse a string containing special characters (e.g. @ in password).
+    import os
+    from sqlalchemy.engine import URL
 
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
+    migration_url = os.environ.get("MIGRATION_DATABASE_URL")
+    if migration_url:
+        engine_url = URL.create(
+            drivername="postgresql",
+            username=os.environ["MIGRATION_DB_USER"],
+            password=os.environ["MIGRATION_DB_PASSWORD"],
+            host=os.environ["MIGRATION_DB_HOST"],
+            port=int(os.environ.get("MIGRATION_DB_PORT", "5432")),
+            database=os.environ.get("MIGRATION_DB_NAME", "postgres"),
         )
+    else:
+        engine_url = sync_url
 
+    connectable = create_engine(engine_url, poolclass=pool.NullPool)
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
             context.run_migrations()
 

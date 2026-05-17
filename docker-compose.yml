@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel_dev
+      POSTGRES_DB: induction_hardening_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d induction_hardening_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  machine-simulator:
+    build:
+      context: ./machine-simulator
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel:sentinel_dev@postgres:5432/induction_hardening_db
+      SIMULATOR_HOST: 0.0.0.0
+      SIMULATOR_PORT: "8000"
+      SIMULATOR_TICK_RATE_HZ: "1"
+      FAILURE_PROBABILITY: "0.05"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pdm-ai-engine:
+    build:
+      context: ./pdm-ai-engine
+      dockerfile: Dockerfile
+    ports:
+      - "8100:8100"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel:sentinel_dev@postgres:5432/induction_hardening_db
+      AI_ENGINE_HOST: 0.0.0.0
+      AI_ENGINE_PORT: "8100"
+      POLL_INTERVAL_S: "1"
+      RISK_WARNING_THRESHOLD: "0.3"
+      RISK_CRITICAL_THRESHOLD: "0.7"
+      MLFLOW_TRACKING_URI: ./mlruns
+      MLFLOW_EXPERIMENT_NAME: sentinel-pdm
+      DRIFT_PSI_WARNING_THRESHOLD: "0.1"
+      DRIFT_PSI_CRITICAL_THRESHOLD: "0.2"
+      DRIFT_BATCH_SIZE: "300"
+      MODELS_DIR: "/app/models"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./pdm-ai-engine/models:/app/models
+
+volumes:
+  pgdata:
